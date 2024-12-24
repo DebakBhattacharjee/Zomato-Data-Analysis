@@ -1,0 +1,126 @@
+import sys
+import numpy as np
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+
+# Get job arguments
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# Read the CSV file from S3 into a DynamicFrame
+AmazonS3_node1734974204383 = glueContext.create_dynamic_frame.from_options(
+    format_options={"quoteChar": "\"", "withHeader": True, "separator": ",", "optimizePerformance": False},
+    connection_type="s3",
+    format="csv",
+    connection_options={"paths": ["s3://zomato-bucket-debak/zomato.csv"], "recurse": True},
+    transformation_ctx="AmazonS3_node1734974204383"
+)
+
+# Convert the DynamicFrame to a DataFrame for easier manipulation
+df = AmazonS3_node1734974204383.toDF()
+
+# Drop unwanted columns
+df = df.drop('url', 'address', 'phone', 'menu_item', 'dish_liked', 'reviews_list')
+
+# Drop duplicates
+df = df.dropDuplicates()
+
+# Define function to handle 'rate' column transformation
+def handlerate(value):
+    if value == 'NEW' or value == '-':
+        return np.nan
+    else:
+        value = str(value).split('/')
+        value = value[0]
+        return float(value)
+
+# Apply the handlerate function to 'rate' column
+from pyspark.sql.functions import udf
+from pyspark.sql.types import FloatType
+
+rate_udf = udf(handlerate, FloatType())
+df = df.withColumn('rate', rate_udf(df['rate']))
+
+# Fill missing 'rate' values with the column mean
+mean_rate = df.selectExpr("avg(rate)").collect()[0][0]
+df = df.fillna({'rate': mean_rate})
+
+# Drop rows with missing values in other columns
+df = df.dropna()
+
+# Rename columns
+df = df.withColumnRenamed('approx_cost(for two people)', 'Cost2plates')
+df = df.withColumnRenamed('listed_in(type)', 'Type')
+df = df.drop('listed_in(city)')
+
+# Define function to handle commas in 'Cost2plates'
+def handlecomma(value):
+    value = str(value)
+    if ',' in value:
+        value = value.replace(',', '')
+    
+    # Convert to float if necessary
+    try:
+        value = float(value)
+        if value.is_integer():
+            return int(value)
+        else:
+            return value
+    except ValueError:
+        return value
+
+# Apply handlecomma function to 'Cost2plates' column
+cost_udf = udf(handlecomma)
+df = df.withColumn('Cost2plates', cost_udf(df['Cost2plates']))
+
+# Handle 'rest_type' transformation
+rest_types_lessthan1000 = df.groupby('rest_type').count().filter('count < 1000').select('rest_type').rdd.flatMap(lambda x: x).collect()
+
+def handle_rest_type(value):
+    if value in rest_types_lessthan1000:
+        return 'others'
+    else:
+        return value
+
+rest_type_udf = udf(handle_rest_type)
+df = df.withColumn('rest_type', rest_type_udf(df['rest_type']))
+
+# Handle 'location' transformation
+location = df.groupby('location').count().filter('count < 300').select('location').rdd.flatMap(lambda x: x).collect()
+
+def handle_location(value):
+    if value in location:
+        return 'others'
+    else:
+        return value
+
+location_udf = udf(handle_location)
+df = df.withColumn('location', location_udf(df['location']))
+
+# Handle 'cuisines' transformation
+cuisines = df.groupby('cuisines').count().filter('count < 100').select('cuisines').rdd.flatMap(lambda x: x).collect()
+
+def handle_cuisines(value):
+    if value in cuisines:
+        return 'others'
+    else:
+        return value
+
+cuisines_udf = udf(handle_cuisines)
+df = df.withColumn('cuisines', cuisines_udf(df['cuisines']))
+
+# Convert the DataFrame back to a DynamicFrame
+final_dynamic_frame = DynamicFrame.fromDF(df, glueContext, "final_dynamic_frame")
+
+output_path = "s3://zomato-bucket-debak/cleaned_zomato_data/"
+df.write.option("header", "true").csv(output_path)
+
+# Commit the job
+job.commit()
